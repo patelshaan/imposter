@@ -1,53 +1,130 @@
 import React, { useEffect, useState, useRef } from "react";
 import { v4 as uuidv4 } from "uuid";
 
-// Single-file React app for a local-demo multiplayer Imposter-like game.
-// Works across browser tabs by syncing rooms through localStorage and the "storage" event.
-// Usage: drop this into a Create-React-App project as App.jsx (install uuid: npm i uuid).
+
+// Firebase real-time networked Imposter-like game (single-file React component).
+// This version includes a robust check for Firebase Realtime Database configuration
+// and will not attempt to use the database unless the firebaseConfig is filled.
+// Usage:
+// 1) Install dependencies: npm i firebase uuid
+// 2) Create a Firebase project, enable Realtime Database.
+// 3) Replace the firebaseConfig object below with your project's config (especially databaseURL).
+// 4) For quick testing set DB rules to allow reads/writes (dev only):
+//    { "rules": { ".read": true, ".write": true } }
+// 5) Drop this file into a Create-React-App project as App.jsx (or import it).
+
+import { initializeApp } from "firebase/app";
+import {
+  getDatabase,
+  ref,
+  onValue,
+  set,
+  update as firebaseUpdate,
+  get,
+  child,
+  runTransaction,
+  remove,
+} from "firebase/database";
+
+// === REPLACE THIS WITH YOUR FIREBASE CONFIG ===
+// IMPORTANT: Make sure databaseURL is set to the Realtime Database URL for your project.
+// Example databaseURL: "https://your-project-id-default-rtdb.firebaseio.com"
+const firebaseConfig = {
+  apiKey: "REPLACE_ME",
+  authDomain: "impostergame-ffd6d.firebaseapp.com",
+  databaseURL: "https://impostergame-ffd6d-default-rtdb.firebaseio.com/", // important for Realtime Database
+  projectId: "impostergame-ffd6d",
+  storageBucket: "impostergame-ffd6d.appspot.com",
+  messagingSenderId: "602086265838",
+  appId: "1:602086265838:web:24c2f7cb1019dd50a574ff",
+};
+// ==============================================
+
+// Helper: validate whether the firebaseConfig looks filled-out.
+function isConfigFilled(cfg) {
+  if (!cfg) return false;
+  const required = ["apiKey", "databaseURL", "projectId", "appId"];
+  for (const k of required) {
+    if (!cfg[k] || typeof cfg[k] !== "string") return false;
+    if (cfg[k].includes("REPLACE_ME") || cfg[k].trim() === "") return false;
+  }
+  // basic check that databaseURL looks like an https URL
+  try {
+    const url = new URL(cfg.databaseURL);
+    if (!url.protocol.startsWith("http")) return false;
+  } catch (e) {
+    return false;
+  }
+  return true;
+}
+
+let firebaseApp = null;
+let db = null;
+let firebaseConfigured = isConfigFilled(firebaseConfig);
+if (firebaseConfigured) {
+  try {
+    firebaseApp = initializeApp(firebaseConfig);
+    // getDatabase can throw if the SDK cannot access database service (e.g. misconfigured)
+    db = getDatabase(firebaseApp);
+  } catch (err) {
+    console.error("Failed to initialize Firebase Realtime Database:", err);
+    firebaseConfigured = false;
+    db = null;
+  }
+} else {
+  console.warn("Firebase configuration is not set. Please replace the firebaseConfig object with your project's values.");
+}
 
 export default function App() {
   const [meId] = useState(() => localStorage.getItem("imposter_meId") || uuidv4());
-  const [name, setName] = useState("");
-  const [rooms, setRooms] = useState(() => JSON.parse(localStorage.getItem("imposter_rooms") || "{}"));
+  const [name, setName] = useState(() => localStorage.getItem("imposter_name") || "");
+  const [rooms, setRooms] = useState({});
   const [currentRoomCode, setCurrentRoomCode] = useState("");
   const [joinCodeInput, setJoinCodeInput] = useState("");
-  const [isLeaderView, setIsLeaderView] = useState(false);
+  const [configOk, setConfigOk] = useState(firebaseConfigured);
   const hintRef = useRef();
 
-  // persist my id
-  useEffect(() => {
-    localStorage.setItem("imposter_meId", meId);
-  }, [meId]);
+  useEffect(() => localStorage.setItem("imposter_meId", meId), [meId]);
+  useEffect(() => localStorage.setItem("imposter_name", name), [name]);
 
-  // listen for localStorage changes to sync rooms across tabs
+  // Listen to rooms list in realtime (only if DB configured)
   useEffect(() => {
-    function onStorage(e) {
-      if (e.key === "imposter_rooms") {
-        setRooms(JSON.parse(e.newValue || "{}"));
-      }
+    if (!configOk || !db) {
+      setRooms({});
+      return; // no DB available
     }
-    window.addEventListener("storage", onStorage);
-    return () => window.removeEventListener("storage", onStorage);
-  }, []);
-
-  // helper: save rooms to localStorage
-  function saveRooms(next) {
-    localStorage.setItem("imposter_rooms", JSON.stringify(next));
-    setRooms(next);
-  }
+    const roomsRef = ref(db, "rooms");
+    const unsubscribe = onValue(roomsRef, (snapshot) => {
+      const val = snapshot.val() || {};
+      setRooms(val);
+    }, (err) => {
+      console.error("Realtime subscription error:", err);
+      // on any error, mark config not ok so UI can show instructions
+      setConfigOk(false);
+    });
+    return () => {
+      try { unsubscribe(); } catch (e) { /* ignore */ }
+    };
+  }, [configOk]);
 
   function makeCode() {
-    const chars = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"; // avoid ambiguous chars
+    const chars = "ABCDEFGHJKMNPQRSTUVWXYZ23456789";
     let code = "";
     for (let i = 0; i < 6; i++) code += chars[Math.floor(Math.random() * chars.length)];
     return code;
   }
 
-  function createRoom() {
+  async function createRoom() {
     if (!name.trim()) return alert("Enter a display name first.");
+    if (!configOk || !db) return alert("Firebase is not configured. Please set firebaseConfig with your project's settings.");
+
     let code = makeCode();
-    const roomsCopy = { ...rooms };
-    while (roomsCopy[code]) code = makeCode();
+    // ensure uniqueness (run small loop if collision)
+    for (let i = 0; i < 6; i++) {
+      const snap = await get(child(ref(db), `rooms/${code}`));
+      if (!snap.exists()) break;
+      code = makeCode();
+    }
 
     const room = {
       code,
@@ -55,126 +132,156 @@ export default function App() {
       impostersCount: 1,
       started: false,
       turnIndex: 0,
-      players: [
-        { id: meId, name: name.trim(), role: "crewmate", joinedAt: Date.now() },
-      ],
-      chat: [],
+      players: {
+        [meId]: { id: meId, name: name.trim(), role: "crewmate", joinedAt: Date.now() },
+      },
+      chat: {},
       createdAt: Date.now(),
     };
-    roomsCopy[code] = room;
-    saveRooms(roomsCopy);
+
+    await set(ref(db, `rooms/${code}`), room);
     setCurrentRoomCode(code);
-    setIsLeaderView(true);
   }
 
-  function joinRoom(code) {
+  async function joinRoom(code) {
     if (!name.trim()) return alert("Enter a display name first.");
-    const roomsCopy = { ...rooms };
-    const room = roomsCopy[code];
-    if (!room) return alert("That room code doesn't exist.");
+    if (!configOk || !db) return alert("Firebase is not configured. Please set firebaseConfig with your project's settings.");
+
+    code = code.toUpperCase();
+    const roomRef = ref(db, `rooms/${code}`);
+    const snap = await get(roomRef);
+    if (!snap.exists()) return alert("That room code doesn't exist.");
+    const room = snap.val();
     if (room.started) return alert("Game already started.");
-    if (room.players.find((p) => p.id === meId)) {
-      setCurrentRoomCode(code);
-      setIsLeaderView(room.leaderId === meId);
+
+    // use transaction to avoid race conditions when multiple people join
+    await runTransaction(ref(db, `rooms/${code}/players`), (players) => {
+      if (!players) players = {};
+      if (!players[meId]) {
+        players[meId] = { id: meId, name: name.trim(), role: "crewmate", joinedAt: Date.now() };
+      }
+      return players;
+    });
+
+    setCurrentRoomCode(code);
+  }
+
+  async function leaveRoom() {
+    if (!currentRoomCode) return;
+    if (!configOk || !db) {
+      // Local cleanup if not connected to DB
+      setCurrentRoomCode("");
       return;
     }
-    room.players.push({ id: meId, name: name.trim(), role: "crewmate", joinedAt: Date.now() });
-    roomsCopy[code] = room;
-    saveRooms(roomsCopy);
-    setCurrentRoomCode(code);
-    setIsLeaderView(room.leaderId === meId);
-  }
+    const code = currentRoomCode;
+    // remove the player
+    await runTransaction(ref(db, `rooms/${code}/players`), (players) => {
+      if (!players) return players;
+      delete players[meId];
+      return players;
+    });
 
-  function leaveRoom() {
-    if (!currentRoomCode) return;
-    const roomsCopy = { ...rooms };
-    const room = roomsCopy[currentRoomCode];
-    if (!room) return setCurrentRoomCode("");
-    room.players = room.players.filter((p) => p.id !== meId);
-    // if leader left, promote first player or delete room
+    // possible leader promotion or room cleanup
+    const roomSnap = await get(ref(db, `rooms/${code}`));
+    if (!roomSnap.exists()) {
+      setCurrentRoomCode("");
+      return;
+    }
+    const room = roomSnap.val();
+    const playerIds = room.players ? Object.keys(room.players) : [];
     if (room.leaderId === meId) {
-      if (room.players.length > 0) {
-        room.leaderId = room.players[0].id;
+      if (playerIds.length > 0) {
+        // promote first remaining player
+        const newLeader = playerIds[0];
+        await firebaseUpdate(ref(db, `rooms/${code}`), { leaderId: newLeader });
       } else {
-        delete roomsCopy[currentRoomCode];
-        saveRooms(roomsCopy);
-        setCurrentRoomCode("");
-        return;
+        // delete room
+        await remove(ref(db, `rooms/${code}`));
       }
     }
-    roomsCopy[currentRoomCode] = room;
-    saveRooms(roomsCopy);
+
     setCurrentRoomCode("");
   }
 
-  function updateRoom(code, patch) {
-    const roomsCopy = { ...rooms };
-    const room = roomsCopy[code];
-    if (!room) return;
-    Object.assign(room, patch);
-    roomsCopy[code] = room;
-    saveRooms(roomsCopy);
+  async function setImposterCount(code, count) {
+    if (!configOk || !db) return alert("Firebase is not configured. Please set firebaseConfig with your project's settings.");
+    const snap = await get(ref(db, `rooms/${code}/players`));
+    const players = snap.exists() ? Object.keys(snap.val()) : [];
+    const safe = Math.max(1, Math.min(count || 1, players.length || 1));
+    await firebaseUpdate(ref(db, `rooms/${code}`), { impostersCount: safe });
   }
 
-  function setImposterCount(code, count) {
-    const room = rooms[code];
-    if (!room) return;
-    updateRoom(code, { impostersCount: Math.max(1, Math.min(count, Math.floor(room.players.length / 1) )) });
-  }
-
-  function startGame(code) {
-    const roomsCopy = { ...rooms };
-    const room = roomsCopy[code];
-    if (!room) return;
-    const players = [...room.players];
-    const numImposters = Math.min(room.impostersCount, Math.max(1, Math.floor(players.length / 2)));
-    // randomly select imposters
+  async function startGame(code) {
+    if (!configOk || !db) return alert("Firebase is not configured. Please set firebaseConfig with your project's settings.");
+    const roomSnap = await get(ref(db, `rooms/${code}`));
+    if (!roomSnap.exists()) return;
+    const room = roomSnap.val();
+    const players = room.players ? Object.values(room.players) : [];
+    if (players.length === 0) return;
+    const numImposters = Math.min(room.impostersCount || 1, Math.max(1, Math.floor(players.length / 2)));
     const shuffled = players.slice().sort(() => Math.random() - 0.5);
-    const imposterIds = new Set(shuffled.slice(0, numImposters).map((p) => p.id));
-    players.forEach((p) => (p.role = imposterIds.has(p.id) ? "imposter" : "crewmate"));
-    room.players = players;
-    room.started = true;
-    room.turnIndex = 0;
-    room.chat = room.chat || [];
-    room.chat.push({ system: true, text: `Game started. ${numImposters} imposters assigned.`, ts: Date.now() });
-    roomsCopy[code] = room;
-    saveRooms(roomsCopy);
+    const imposterIds = shuffled.slice(0, numImposters).map((p) => p.id);
+
+    // write roles and set started
+    const updates = {};
+    players.forEach((p) => {
+      updates[`rooms/${code}/players/${p.id}/role`] = imposterIds.includes(p.id) ? "imposter" : "crewmate";
+    });
+    updates[`rooms/${code}/started`] = true;
+    updates[`rooms/${code}/turnIndex`] = 0;
+    const msgKey = `rooms/${code}/chat/${Date.now()}`;
+    updates[msgKey] = { system: true, text: `Game started. ${numImposters} imposters assigned.`, ts: Date.now() };
+
+    await firebaseUpdate(ref(db), updates);
   }
 
-  function sendHint(text) {
-    const roomsCopy = { ...rooms };
-    const room = roomsCopy[currentRoomCode];
-    if (!room) return;
-    const currentPlayer = room.players[room.turnIndex % room.players.length];
-    if (!currentPlayer || currentPlayer.id !== meId) return alert("It's not your turn.");
-    room.chat.push({ playerId: meId, name: name.trim(), text: text.trim(), ts: Date.now() });
-    room.turnIndex = (room.turnIndex + 1) % room.players.length;
-    roomsCopy[currentRoomCode] = room;
-    saveRooms(roomsCopy);
+  async function sendHint(text) {
+    if (!configOk || !db) return alert("Firebase is not configured. Please set firebaseConfig with your project's settings.");
+    const code = currentRoomCode;
+    if (!code) return;
+    const roomSnap = await get(ref(db, `rooms/${code}`));
+    if (!roomSnap.exists()) return;
+    const room = roomSnap.val();
+    const playerIds = room.players ? Object.keys(room.players) : [];
+    if (playerIds.length === 0) return;
+    const currentPlayerId = playerIds[room.turnIndex % playerIds.length];
+    if (currentPlayerId !== meId) return alert("It's not your turn.");
+
+    const chatKey = `rooms/${code}/chat/${Date.now()}`;
+    const nextTurn = (room.turnIndex + 1) % playerIds.length;
+    const updates = {};
+    updates[chatKey] = { playerId: meId, name: name.trim(), text: text.trim(), ts: Date.now() };
+    updates[`rooms/${code}/turnIndex`] = nextTurn;
+    await firebaseUpdate(ref(db), updates);
   }
 
-  function kickPlayer(playerId) {
+  async function kickPlayer(playerId) {
     if (!currentRoomCode) return;
-    const roomsCopy = { ...rooms };
-    const room = roomsCopy[currentRoomCode];
-    if (!room) return;
-    room.players = room.players.filter((p) => p.id !== playerId);
-    if (room.leaderId === playerId) {
-      room.leaderId = room.players.length ? room.players[0].id : null;
-    }
-    roomsCopy[currentRoomCode] = room;
-    saveRooms(roomsCopy);
+    if (!configOk || !db) return alert("Firebase is not configured. Please set firebaseConfig with your project's settings.");
+    const code = currentRoomCode;
+    // only leader can kick (client-side check)
+    const roomSnap = await get(ref(db, `rooms/${code}`));
+    if (!roomSnap.exists()) return;
+    const room = roomSnap.val();
+    if (room.leaderId !== meId) return alert("Only leader can kick players.");
+
+    await runTransaction(ref(db, `rooms/${code}/players`), (players) => {
+      if (!players) return players;
+      delete players[playerId];
+      return players;
+    });
   }
 
-  // UI helpers
+  // Render helpers similar to previous local version but read live data from `rooms` state.
   function renderLobby(room) {
     const amLeader = room.leaderId === meId;
+    const playerList = room.players ? Object.values(room.players) : [];
     return (
       <div className="p-4 space-y-4">
         <div className="flex items-center justify-between">
           <div>
             <h2 className="text-xl font-bold">Room {room.code}</h2>
-            <p className="text-sm">Leader: {room.players.find((p) => p.id === room.leaderId)?.name || "-"}</p>
+            <p className="text-sm">Leader: {playerList.find((p) => p.id === room.leaderId)?.name || "-"}</p>
             <p className="text-sm">Imposters: {room.impostersCount}</p>
           </div>
           <div>
@@ -183,9 +290,9 @@ export default function App() {
         </div>
 
         <div className="bg-white rounded shadow p-3">
-          <h3 className="font-semibold">Players ({room.players.length})</h3>
+          <h3 className="font-semibold">Players ({playerList.length})</h3>
           <ul className="mt-2 space-y-1">
-            {room.players.map((p) => (
+            {playerList.map((p) => (
               <li key={p.id} className="flex items-center justify-between">
                 <div>
                   <span className="font-medium">{p.name}</span>
@@ -205,7 +312,7 @@ export default function App() {
         {amLeader && !room.started && (
           <div className="space-y-2">
             <label className="block text-sm">Set number of imposters</label>
-            <input type="number" min={1} max={Math.max(1, room.players.length - 1)} value={room.impostersCount}
+            <input type="number" min={1} max={Math.max(1, playerList.length)} value={room.impostersCount}
               onChange={(e) => setImposterCount(room.code, parseInt(e.target.value || "1", 10))}
               className="w-24 p-1 rounded border" />
             <div>
@@ -220,24 +327,28 @@ export default function App() {
   }
 
   function renderGame(room) {
-    const mePlayer = room.players.find((p) => p.id === meId);
-    const currentPlayer = room.players[room.turnIndex % room.players.length];
+    const playerList = room.players ? Object.values(room.players) : [];
+    const mePlayer = playerList.find((p) => p.id === meId) || {};
+    const currentPlayer = playerList.length ? playerList[room.turnIndex % playerList.length] : null;
+
+    const chatEntries = room.chat ? Object.values(room.chat).sort((a,b)=>a.ts - b.ts) : [];
+
     return (
       <div className="space-y-3">
         <div className="bg-white rounded shadow p-3">
           <div className="flex justify-between">
             <div>
-              <div className="text-sm">Your role: <strong>{mePlayer?.role}</strong></div>
+              <div className="text-sm">Your role: <strong>{mePlayer.role || 'unknown'}</strong></div>
               <div className="text-sm">Turn: <strong>{currentPlayer?.name}</strong></div>
             </div>
-            <div className="text-sm">Players left: {room.players.length}</div>
+            <div className="text-sm">Players left: {playerList.length}</div>
           </div>
         </div>
 
         <div className="bg-white rounded shadow p-3 max-h-60 overflow-auto">
           <h4 className="font-semibold">Chat</h4>
           <div className="mt-2 space-y-2">
-            {room.chat.map((m, idx) => (
+            {chatEntries.map((m, idx) => (
               <div key={idx} className={`p-2 rounded ${m.system ? 'bg-gray-100' : (m.playerId === meId ? 'bg-blue-50' : 'bg-gray-50')}`}>
                 {m.system ? (
                   <em className="text-sm">{m.text}</em>
@@ -280,13 +391,12 @@ export default function App() {
     );
   }
 
-  // app shell
   return (
     <div className="min-h-screen bg-gray-50 p-6 font-sans">
       <div className="max-w-3xl mx-auto">
         <header className="flex items-center justify-between mb-6">
-          <h1 className="text-2xl font-bold">Imposter — Hint Party (Demo)</h1>
-          <div className="text-sm text-gray-600">Open in multiple tabs to simulate players</div>
+          <h1 className="text-2xl font-bold">Imposter — Hint Party (Firebase)</h1>
+          <div className="text-sm text-gray-600">Open on multiple devices and join with the room code</div>
         </header>
 
         <main className="bg-gray-100 p-6 rounded shadow">
@@ -305,14 +415,14 @@ export default function App() {
               <div>
                 <h4 className="font-semibold">Active Rooms (click to join)</h4>
                 <div className="mt-2 grid grid-cols-1 gap-2">
-                  {Object.values(rooms).length === 0 ? (
-                    <div className="text-sm text-gray-500">No rooms yet</div>
+                  {Object.values(rooms).filter(r=>!r.started).length === 0 ? (
+                    <div className="text-sm text-gray-500">No open rooms yet</div>
                   ) : (
-                    Object.values(rooms).map((r) => (
+                    Object.values(rooms).filter(r=>!r.started).map((r) => (
                       <div key={r.code} className="p-3 bg-white rounded shadow flex items-center justify-between">
                         <div>
                           <div className="font-medium">{r.code}</div>
-                          <div className="text-sm text-gray-500">Players: {r.players.length} — Leader: {r.players.find(p=>p.id===r.leaderId)?.name || '-'}{r.started ? ' (started)' : ''}</div>
+                          <div className="text-sm text-gray-500">Players: {r.players ? Object.keys(r.players).length : 0} — Leader: {r.players ? Object.values(r.players).find(p=>p.id===r.leaderId)?.name : '-'}{r.started ? ' (started)' : ''}</div>
                         </div>
                         <div>
                           <button className="px-2 py-1 rounded bg-blue-100" onClick={() => joinRoom(r.code)}>Join</button>
@@ -335,7 +445,7 @@ export default function App() {
         </main>
 
         <footer className="mt-4 text-xs text-gray-500">
-          This is a local demo using localStorage for sync — it's great for testing in multiple tabs but not a production networked server. If you want a networked version (WebSocket or Firebase), tell me and I can add it.
+          This version uses Firebase Realtime Database. For production use, secure your database with proper rules and consider using Firebase Auth.
         </footer>
       </div>
     </div>
